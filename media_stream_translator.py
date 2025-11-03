@@ -20,6 +20,8 @@ from twilio.rest import Client
 import threading
 import time
 import requests
+from queue import Queue
+from mutagen.mp3 import MP3
 
 # Load Google credentials from environment
 google_creds_json = os.environ.get('GOOGLE_APPLICATION_CREDENTIALS_JSON')
@@ -131,6 +133,11 @@ else:
 # Active streams and conference participants
 active_streams = {}
 conference_participants = defaultdict(dict)
+
+# Audio playback queues - one queue per participant
+audio_queues = {}  # Key: participant_sid -> Queue
+queue_processors = {}  # Key: participant_sid -> thread
+queue_lock = threading.Lock()  # Lock for thread-safe queue/processor management
 
 @app.route('/')
 def home():
@@ -290,6 +297,22 @@ def conference_status():
         elif event == 'conference-end':
             print(f"🧹 Cleaning up conference: {conference_name}")
             
+            # Stop queue processors for both participants (thread-safe)
+            conf_info = conference_participants[conference_name]
+            for role in ['caller', 'receiver']:
+                if role in conf_info:
+                    participant_sid = conf_info[role].get('participant_sid')
+                    if participant_sid:
+                        with queue_lock:
+                            if participant_sid in audio_queues:
+                                # Send None to stop the processor
+                                audio_queues[participant_sid].put(None)
+                                print(f"   🛑 Signaled queue processor to stop for {role}")
+                                # Clean up queue and processor reference
+                                del audio_queues[participant_sid]
+                                if participant_sid in queue_processors:
+                                    del queue_processors[participant_sid]
+            
             # Delete all TTS audio files for this conference
             if 'audio_files' in conference_participants[conference_name]:
                 for filepath in conference_participants[conference_name]['audio_files']:
@@ -396,21 +419,100 @@ def synthesize_speech_url(text, language_code, conference_name):
         print(f"   ❌ TTS error: {e}")
         return None
 
-def play_audio_to_participant(conference_sid, participant_sid, audio_filename):
-    """Play audio to a specific conference participant using announce_url"""
+def get_audio_duration(filepath):
+    """Get the duration of an MP3 file in seconds"""
     try:
-        # Use the Conference Participant API to play audio
-        # announce_url needs to point to a TwiML endpoint
-        announce_twiml_url = f"https://{app_domain}/play-tts/{audio_filename}"
+        audio = MP3(filepath)
+        return audio.info.length
+    except:
+        # Fallback: estimate based on file size (rough approximation)
+        try:
+            file_size = os.path.getsize(filepath)
+            # MP3 at ~128kbps = ~16KB/sec
+            return file_size / 16000
+        except:
+            return 2.0  # Default 2 seconds if all else fails
+
+def process_audio_queue(participant_sid, conference_sid, queue):
+    """Background thread to process audio queue for a participant
+    
+    Args:
+        participant_sid: The participant ID
+        conference_sid: The conference ID
+        queue: The Queue object to process (passed in to avoid defaultdict issues)
+    """
+    print(f"📢 Queue processor started for participant {participant_sid}")
+    
+    while True:
+        try:
+            # Get next audio file from queue (blocks until available)
+            audio_filename = queue.get(timeout=60)
+            
+            # None is the signal to stop the processor
+            if audio_filename is None:
+                print(f"📢 Queue processor stopping for participant {participant_sid}")
+                queue.task_done()
+                break
+            
+            # Play the audio
+            try:
+                announce_twiml_url = f"https://{app_domain}/play-tts/{audio_filename}"
+                
+                twilio_client.conferences(conference_sid).participants(participant_sid).update(
+                    announce_url=announce_twiml_url,
+                    announce_method='GET'
+                )
+                print(f"   🔊 [Queue] Playing audio to participant {participant_sid}")
+                
+                # Calculate how long to wait before playing next audio
+                filepath = f"static/{audio_filename}"
+                duration = get_audio_duration(filepath)
+                
+                # Wait for audio to finish plus a small buffer
+                time.sleep(duration + 0.3)
+                
+            except Exception as e:
+                print(f"   ❌ Queue playback error: {e}")
+            
+            # Mark task as done
+            queue.task_done()
+            
+        except Exception as e:
+            # Timeout - queue is empty, keep thread alive
+            if isinstance(e, Exception) and "Empty" not in str(type(e)):
+                print(f"   ⚠️  Queue processor error: {e}")
+            continue
+
+def queue_audio_to_participant(conference_sid, participant_sid, audio_filename):
+    """Add audio to the playback queue for a participant (thread-safe)"""
+    try:
+        with queue_lock:
+            # Create queue if it doesn't exist
+            if participant_sid not in audio_queues:
+                audio_queues[participant_sid] = Queue()
+            
+            queue = audio_queues[participant_sid]
+            
+            # Start queue processor if not already running
+            if participant_sid not in queue_processors or not queue_processors[participant_sid].is_alive():
+                processor_thread = threading.Thread(
+                    target=process_audio_queue,
+                    args=(participant_sid, conference_sid, queue),  # Pass queue object
+                    daemon=True
+                )
+                processor_thread.start()
+                queue_processors[participant_sid] = processor_thread
+                print(f"   🎬 Started queue processor for participant {participant_sid}")
         
-        twilio_client.conferences(conference_sid).participants(participant_sid).update(
-            announce_url=announce_twiml_url,
-            announce_method='GET'
-        )
-        print(f"   🔊 Playing audio to participant {participant_sid}")
+        # Add audio to queue (outside lock to avoid blocking)
+        queue.put(audio_filename)
+        queue_size = queue.qsize()
+        print(f"   ➕ Added to queue (size: {queue_size})")
         return True
     except Exception as e:
-        print(f"   ❌ Error playing audio: {e}")
+        print(f"   ❌ Error queueing audio: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 @sock.route('/media-stream/<conference_name>/<participant_role>')
@@ -556,9 +658,9 @@ def media_stream(ws, conference_name, participant_role):
                                         target_participant_sid = target_participant.get('participant_sid')
                                         
                                         if conference_sid and target_participant_sid:
-                                            # Play translated audio to the other participant
-                                            play_audio_to_participant(conference_sid, target_participant_sid, audio_filename)
-                                            print(f"   ✅ Translation delivered to {target_role}")
+                                            # Add translated audio to the participant's queue
+                                            queue_audio_to_participant(conference_sid, target_participant_sid, audio_filename)
+                                            print(f"   ✅ Translation queued for {target_role}")
                                         else:
                                             print(f"   ⚠️  Target participant not ready yet")
                     

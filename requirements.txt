@@ -27,3 +27,4 @@ sift-stack-py
 socketio
 twilio==9.8.4
 websockets==11.0.3
+mutagen
