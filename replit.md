@@ -81,6 +81,15 @@ Once the webhook is configured, your translator will be fully operational!
 - 🔊 High Quality Audio: Google Cloud TTS with natural voices
 
 ## Recent Changes
+- **Nov 03, 2025**: ✅ **SEQUENTIAL AUDIO PLAYBACK QUEUE SYSTEM**
+  - ✅ Implemented thread-safe queue system to prevent overlapping translations
+  - ✅ Fixed race conditions using threading.Lock for queue/processor management
+  - ✅ Translations now play sequentially when speakers talk rapidly
+  - ✅ Added audio duration calculation using mutagen for precise timing
+  - ✅ Proper cleanup on conference end with no resource leaks
+  - ✅ Each participant has dedicated queue processor thread
+  - ✅ Architect-reviewed for thread-safety and correctness
+
 - **Nov 03, 2025**: ✅ **IMPROVED SENTENCE COMPLETION & BUFFERING**
   - ✅ Fixed mid-sentence translation interruptions
   - ✅ Implemented silence detection using audio amplitude analysis
