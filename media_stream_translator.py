@@ -420,6 +420,9 @@ def media_stream(ws, conference_name, participant_role):
     stream_sid = None
     audio_buffer = bytearray()
     last_transcript = ""
+    last_process_time = time.time()
+    silence_count = 0
+    is_speaking = False
     
     print(f"\n{'='*60}")
     print(f"🔌 WebSocket CONNECTED")
@@ -427,6 +430,18 @@ def media_stream(ws, conference_name, participant_role):
     print(f"   Role: {participant_role}")
     print(f"   Time: {datetime.now().strftime('%H:%M:%S')}")
     print(f"{'='*60}\n")
+    
+    def is_silence(audio_chunk):
+        """Detect if audio chunk is silence based on amplitude"""
+        try:
+            # Convert mulaw to linear PCM
+            pcm = audioop.ulaw2lin(bytes(audio_chunk), 2)
+            # Calculate RMS (volume level)
+            rms = audioop.rms(pcm, 2)
+            # Threshold for silence (adjust based on testing)
+            return rms < 300
+        except:
+            return False
     
     try:
         while True:
@@ -448,10 +463,38 @@ def media_stream(ws, conference_name, participant_role):
                 # Receive audio payload (mulaw, base64 encoded)
                 payload = data['media']['payload']
                 audio_chunk = base64.b64decode(payload)
-                audio_buffer.extend(audio_chunk)
                 
-                # Process when buffer reaches ~0.75 seconds (6000 bytes at 8kHz) for faster response
-                if len(audio_buffer) >= 6000:
+                # Detect if this chunk contains speech or silence
+                chunk_is_silent = is_silence(audio_chunk)
+                
+                if not chunk_is_silent:
+                    # Speech detected
+                    is_speaking = True
+                    silence_count = 0
+                    audio_buffer.extend(audio_chunk)
+                elif is_speaking:
+                    # We were speaking, now silence - accumulate to catch end of sentence
+                    audio_buffer.extend(audio_chunk)
+                    silence_count += 1
+                
+                # Process conditions:
+                # 1. Buffer has at least 2.5 seconds of audio (20000 bytes at 8kHz)
+                # 2. AND we've detected silence for at least 0.5 seconds (4 chunks of ~125ms)
+                # 3. OR buffer is getting too large (> 5 seconds = 40000 bytes)
+                current_time = time.time()
+                should_process = False
+                
+                if len(audio_buffer) >= 20000 and silence_count >= 4:
+                    # Good amount of audio + pause detected = likely complete sentence
+                    should_process = True
+                elif len(audio_buffer) >= 40000:
+                    # Buffer too large, process anyway to avoid memory issues
+                    should_process = True
+                elif is_speaking and len(audio_buffer) >= 16000 and (current_time - last_process_time) > 3.0:
+                    # Been speaking for a while with decent buffer, process to avoid long delays
+                    should_process = True
+                
+                if should_process and len(audio_buffer) > 0:
                     try:
                         # Convert mulaw to linear PCM for Google Speech-to-Text
                         audio_pcm = audioop.ulaw2lin(bytes(audio_buffer), 2)
@@ -471,7 +514,7 @@ def media_stream(ws, conference_name, participant_role):
                             target_role = "caller"
                             speech_model = "default"  # Use default model for Hindi (phone_call not supported)
                         
-                        # Transcribe with Google Speech-to-Text (optimized for speed)
+                        # Transcribe with Google Speech-to-Text (optimized for complete sentences)
                         audio_content = speech.RecognitionAudio(content=audio_pcm)
                         config = speech.RecognitionConfig(
                             encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
@@ -488,38 +531,47 @@ def media_stream(ws, conference_name, participant_role):
                             transcript = result.alternatives[0].transcript.strip()
                             confidence = result.alternatives[0].confidence
                             
-                            # Lower confidence threshold for faster response, filter duplicates
-                            if confidence > 0.5 and transcript and transcript != last_transcript:
-                                print(f"\n🎤 {participant_role.upper()} ({source_lang}): {transcript} ({confidence:.2f})")
-                                last_transcript = transcript
+                            # Higher confidence threshold for better quality, filter duplicates and partial repeats
+                            if confidence > 0.7 and transcript:
+                                # Check if this is a meaningful new transcript (not just a substring of previous)
+                                is_duplicate = (transcript == last_transcript or 
+                                              (last_transcript and transcript in last_transcript) or
+                                              (last_transcript and last_transcript in transcript and len(transcript) - len(last_transcript) < 5))
                                 
-                                # Translate using fixed language assignment
-                                translated_text = translate_text(transcript, source_lang, target_lang)
-                                print(f"   🔄 → {target_lang.upper()}: {translated_text}")
-                                
-                                # Generate TTS audio file
-                                audio_filename = synthesize_speech_url(translated_text, target_lang, conference_name)
-                                
-                                if audio_filename and conference_name in conference_participants:
-                                    conf_info = conference_participants[conference_name]
-                                    conference_sid = conf_info.get('conference_sid')
-                                    target_participant = conf_info.get(target_role, {})
-                                    target_participant_sid = target_participant.get('participant_sid')
+                                if not is_duplicate:
+                                    print(f"\n🎤 {participant_role.upper()} ({source_lang}): {transcript} ({confidence:.2f})")
+                                    last_transcript = transcript
                                     
-                                    if conference_sid and target_participant_sid:
-                                        # Play translated audio to the other participant
-                                        play_audio_to_participant(conference_sid, target_participant_sid, audio_filename)
-                                        print(f"   ✅ Translation delivered to {target_role}")
-                                    else:
-                                        print(f"   ⚠️  Target participant not ready yet")
+                                    # Translate using fixed language assignment
+                                    translated_text = translate_text(transcript, source_lang, target_lang)
+                                    print(f"   🔄 → {target_lang.upper()}: {translated_text}")
+                                    
+                                    # Generate TTS audio file
+                                    audio_filename = synthesize_speech_url(translated_text, target_lang, conference_name)
+                                    
+                                    if audio_filename and conference_name in conference_participants:
+                                        conf_info = conference_participants[conference_name]
+                                        conference_sid = conf_info.get('conference_sid')
+                                        target_participant = conf_info.get(target_role, {})
+                                        target_participant_sid = target_participant.get('participant_sid')
+                                        
+                                        if conference_sid and target_participant_sid:
+                                            # Play translated audio to the other participant
+                                            play_audio_to_participant(conference_sid, target_participant_sid, audio_filename)
+                                            print(f"   ✅ Translation delivered to {target_role}")
+                                        else:
+                                            print(f"   ⚠️  Target participant not ready yet")
                     
                     except Exception as e:
                         print(f"   ❌ Processing error: {e}")
                         import traceback
                         traceback.print_exc()
                     
-                    # Clear buffer
+                    # Clear buffer and reset state
                     audio_buffer = bytearray()
+                    is_speaking = False
+                    silence_count = 0
+                    last_process_time = current_time
             
             elif event == 'stop':
                 print(f"⏹️  Stream stopped: {stream_sid}")
